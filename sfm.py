@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+import argparse
 from scipy.optimize import least_squares
 from tomlkit import boolean
 from tqdm import tqdm
@@ -43,11 +44,15 @@ class Image_loader:
 
 
 class Sfm:
-    def __init__(self, img_dir: str, downscale_factor: float = 2.0) -> None:
+    def __init__(self, img_dir: str, features_dir: str = "", downscale_factor: float = 2.0) -> None:
         """
         Initialise and Sfm object.
         """
         self.image_loader = Image_loader(img_dir, downscale_factor)
+        self.features_dir = features_dir
+        self.use_deep = False
+        if features_dir:
+            self.use_deep = True
 
     def triangulation(self, projection_matrix_1, projection_matrix_2, point_2d_1, point_2d_2) -> tuple:
         """
@@ -72,7 +77,7 @@ class Sfm:
 
         # Converts a rotation matrix to a rotation vector or vice versa
         rot_matrix, _ = cv2.Rodrigues(rot_vector_calc)
-        return rot_matrix, tran_vector, inliers.ravel()
+        return rot_matrix, tran_vector, inliers
 
 
     def reprojection_error(self, obj_points, image_points, projection_matrix, K) -> tuple:
@@ -153,7 +158,23 @@ class Sfm:
         return np.array(cm_points_1), np.array(cm_points_2), mask_array_1, mask_array_2
 
 
-    def find_features(self, image_0, image_1) -> tuple:
+    def find_features_deep(self, image_0_path, image_1_path) -> tuple:
+        # print(image_0_path, image_1_path)
+        # breakpoint()
+        image_0_name = os.path.splitext(os.path.basename(image_0_path))[0]
+        image_1_name = os.path.splitext(os.path.basename(image_1_path))[0]
+        path = os.path.join(self.features_dir, f"{image_0_name}_{image_1_name}_matches.npz")
+        npz = np.load(path)
+        keypoints0 = npz['keypoints0']
+        keypoints1 = npz['keypoints1']
+        matches = npz['matches']
+        features0 = np.array([keypoints0[i] for i in range(keypoints0.shape[0]) if matches[i] > -1], dtype='float32')
+        features1 = np.array([keypoints1[matches[i]] for i in range(matches.shape[0]) if matches[i] > -1], dtype='float32')
+        assert len(features0) == len(features1)
+        return features0, features1
+
+
+    def find_features_SIFT(self, image_0, image_1) -> tuple:
         """
         Feature detection using the sift algorithm and KNN
         return keypoints(features) of image1 and image2
@@ -189,13 +210,19 @@ class Sfm:
         total_points = np.zeros((1, 3))
         total_colors = np.zeros((1, 3))
 
-        image_0 = self.image_loader.downscale_image(cv2.imread(self.image_loader.image_list[0]))
-        image_1 = self.image_loader.downscale_image(cv2.imread(self.image_loader.image_list[1]))
-        feature_0, feature_1 = self.find_features(image_0, image_1)
+        image_0_path = self.image_loader.image_list[0]
+        image_1_path = self.image_loader.image_list[1]
+        image_0 = self.image_loader.downscale_image(cv2.imread(image_0_path))
+        image_1 = self.image_loader.downscale_image(cv2.imread(image_1_path))
+
+        if self.use_deep:
+            feature_0, feature_1 = self.find_features_deep(image_0_path, image_1_path)
+        else:
+            feature_0, feature_1 = self.find_features_SIFT(image_0, image_1)
 
         # Essential matrix
         # We recover E because we have K from our datasets
-        breakpoint()
+        # breakpoint()
         essential_matrix, em_mask = cv2.findEssentialMat(
             feature_0,
             feature_1,
@@ -221,7 +248,7 @@ class Sfm:
         PI_matrix_1[:3, 3] = tran_matrix.ravel()
         projection_matrix_1 = np.matmul(self.image_loader.K, PI_matrix_1)
 
-        breakpoint()
+        # breakpoint()
         points_3d = self.triangulation(projection_matrix_0, projection_matrix_1, feature_0, feature_1)  # shape: (4, N)
         points_3d = cv2.convertPointsFromHomogeneous(points_3d.T)                                       # shape: (N, 1, 3)
         error = self.reprojection_error(points_3d, feature_1.T, PI_matrix_1, self.image_loader.K)
@@ -237,6 +264,7 @@ class Sfm:
             dist_coeff=np.zeros((5, 1), dtype=np.float32),
         )
         if inliers is not None:
+            inliers = inliers.ravel()
             points_3d = points_3d[inliers]
             feature_0 = feature_0[inliers]
             feature_1 = feature_1[inliers]
@@ -245,10 +273,16 @@ class Sfm:
         total_images = len(self.image_loader.image_list) - 2
         pose_array = np.hstack((np.hstack((pose_array, projection_matrix_0.ravel())), projection_matrix_1.ravel()))
 
-
         for i in tqdm(range(total_images)):
-            image_2 = self.image_loader.downscale_image(cv2.imread(self.image_loader.image_list[i + 2]))
-            features_cur, features_2 = self.find_features(image_1, image_2)
+            image_2_path = self.image_loader.image_list[i + 2]
+            image_2 = self.image_loader.downscale_image(cv2.imread(image_2_path))
+
+            if self.use_deep:
+                features_cur, features_2 = self.find_features_deep(image_1_path, image_2_path)
+            else:
+                features_cur, features_2 = self.find_features_SIFT(image_1, image_2)
+
+            # features_cur, features_2 = self.find_features_SIFT(image_1, image_2)
 
             if i != 0:
                 points_3d = self.triangulation(projection_matrix_0, projection_matrix_1, feature_0, feature_1)
@@ -267,6 +301,7 @@ class Sfm:
                 dist_coeff=np.zeros((5, 1), dtype=np.float32),
             )
             if inliers is not None:
+                inliers = inliers.ravel()
                 points_3d = points_3d[inliers]
                 cm_points_2 = cm_points_2[inliers]
                 cm_points_cur = cm_points_cur[inliers]
@@ -305,6 +340,7 @@ class Sfm:
 
             image_0 = np.copy(image_1)
             image_1 = np.copy(image_2)
+            image_1_path = image_2_path
             feature_0 = np.copy(features_cur)
             feature_1 = np.copy(features_2)
             projection_matrix_1 = np.copy(projection_matrix_2)
@@ -324,9 +360,24 @@ class Sfm:
         )
 
 
+def valid_path(path):
+    if not os.path.exists(path):
+        raise argparse.ArgumentTypeError("The file path does not exist")
+    return path
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-d', '--dataset', type=valid_path, required=True, help='path of dataset (directory) to create the 3d reconstruction')
+parser.add_argument('-f', '--features', type=valid_path, default=None, help='path of features (directory) that features are pre-created via a deep model')
+
 if __name__ == "__main__":
+    args = parser.parse_args()
+    features = args.features
+    dataset = args.dataset
+
     sfm = Sfm(
-        "/home/mehdi/learning/new/sut/ACV/project/code/Multiview-3D-Reconstruction/Datasets/fountain-P11",
-        downscale_factor=2,
+        img_dir=dataset,
+        features_dir=features,
+        downscale_factor=1,
     )
     sfm()
